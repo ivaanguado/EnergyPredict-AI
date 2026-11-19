@@ -1,44 +1,275 @@
+
+import argparse
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import joblib
 import pandas as pd
 
+from energypredict.ingestion.entsoe_client import (
+    get_entsoe_demand,
+    parse_entsoe_demand,
+)
+from energypredict.processing.entsoe_transform import (
+    transform_entsoe_to_hourly,
+)
+from energypredict.prediction.recursive_forecast import (
+    forecast_recursive,
+)
+from energypredict.prediction.direct_forecast import (
+    forecast_direct,
+)
+
+from energypredict.prediction.hybrid_forecast import (
+    forecast_hybrid,
+)
+
+
 PROJECT_ROOT = Path(__file__).resolve().parent
 
-MODEL_PATH = PROJECT_ROOT / "models/random_forest_v1.joblib"
-DATA_PATH = PROJECT_ROOT / "data/processed/features_spain_2024.parquet"
+RECURSIVE_MODEL_PATH = (
+    PROJECT_ROOT / "models/random_forest_v1.joblib"
+)
+
+DIRECT_MODELS_DIR = (
+    PROJECT_ROOT / "models/direct_final"
+)
+
+SPAIN_TIMEZONE = ZoneInfo("Europe/Madrid")
 
 
-def predict_next_hour():
-    # Cargar el modelo entrenado
-    artifact = joblib.load(MODEL_PATH)
+def load_recursive_model():
+    artifact = joblib.load(RECURSIVE_MODEL_PATH)
 
-    model = artifact["model"]
-    feature_columns = artifact["feature_columns"]
+    return (
+        artifact["model"],
+        artifact["feature_columns"],
+    )
 
-    # Cargar los datos históricos
-    df = pd.read_parquet(DATA_PATH)
-    df = df.sort_values("target_datetime_utc")
 
-    # Seleccionar la última observación
-    last_row = df.iloc[[-1]]
+def load_direct_models():
+    models = {}
+    feature_columns = None
 
-    # Preparar las características
-    X = last_row[feature_columns]
+    for horizon in range(1, 7):
+        path = (
+            DIRECT_MODELS_DIR
+            / f"random_forest_h{horizon}.joblib"
+        )
 
-    # Realizar predicción
-    prediction = model.predict(X)[0]
+        artifact = joblib.load(path)
 
-    # Obtener fecha objetivo
-    prediction_date = last_row["target_datetime_utc"].iloc[0]
+        columns = artifact["feature_columns"]
 
-    # Mostrar resultado
+        if feature_columns is None:
+            feature_columns = columns
+        elif feature_columns != columns:
+            raise ValueError(
+                "Los modelos directos tienen "
+                "características incompatibles."
+            )
+
+        models[horizon] = artifact["model"]
+
+    return models, feature_columns
+
+
+def get_recent_history():
+    now = datetime.now(timezone.utc)
+
+    end = (
+        now.replace(
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        + timedelta(days=1)
+    )
+
+    start = end - timedelta(days=10)
+
+    print("\nConsultando datos recientes de ENTSO-E...")
+
+    xml = get_entsoe_demand(
+        start_date=start.strftime("%Y%m%d%H%M"),
+        end_date=end.strftime("%Y%m%d%H%M"),
+    )
+
+    raw = parse_entsoe_demand(xml)
+
+    hourly = transform_entsoe_to_hourly(raw)
+
+    if hourly.empty:
+        raise ValueError(
+            "No se han obtenido observaciones horarias."
+        )
+
+    return hourly
+
+
+def predict_next_hour(method="recursive"):
+    # 1. Obtener datos recientes
+    hourly = get_recent_history()
+
+    # 2. Calcular el horizonte necesario
+    last_observation = hourly["datetime_utc"].max()
+
+    target_hour = (
+        pd.Timestamp.now(tz="UTC").floor("h")
+        + pd.Timedelta(hours=1)
+    )
+
+    steps = int(
+        (target_hour - last_observation)
+        / pd.Timedelta(hours=1)
+    )
+
+    if steps < 1:
+        raise ValueError(
+            "La última observación no es anterior "
+            "a la hora objetivo."
+        )
+
+    max_steps = 12 if method == "recursive" else 6
+
+    if steps > max_steps:
+        raise ValueError(
+            f"Se necesitan {steps} predicciones, "
+            f"pero el método {method} admite "
+            f"un máximo de {max_steps} horas."
+        )
+
+    print(f"\nMétodo seleccionado: {method}")
+    print(f"Horizonte necesario: {steps} horas")
+    print(f"Hora objetivo UTC: {target_hour}")
+
+    # 3. Generar predicciones
+    if method == "recursive":
+        model, feature_columns = (
+            load_recursive_model()
+        )
+
+        forecast = forecast_recursive(
+            model=model,
+            feature_columns=feature_columns,
+            history=hourly,
+            steps=steps,
+        )
+
+    elif method == "direct":
+        models, feature_columns = (
+            load_direct_models()
+        )
+
+        forecast = forecast_direct(
+            models=models,
+            feature_columns=feature_columns,
+            history=hourly,
+            max_horizon=steps,
+        )
+
+    elif method == "hybrid":
+        recursive_model, recursive_columns = (
+            load_recursive_model()
+        )
+
+        direct_models, direct_columns = (
+            load_direct_models()
+        )
+
+        if recursive_columns != direct_columns:
+            raise ValueError(
+                "Las características de los modelos "
+                "recursivo y directo no coinciden."
+            )
+
+        forecast = forecast_hybrid(
+            recursive_model=recursive_model,
+            direct_models=direct_models,
+            feature_columns=recursive_columns,
+            history=hourly,
+            steps=steps,
+        )
+
+    else:
+        raise ValueError(
+            f"Método no reconocido: {method}"
+        )
+
+    # 4. Mostrar resultados
     print("\nENERGYPREDICT AI")
     print("--------------------------")
     print("Modelo: Random Forest")
-    print(f"Fecha objetivo: {prediction_date}")
-    print(f"Demanda estimada: {prediction:,.2f} MW")
+    print(f"Método: {method}")
+    print(f"Última observación: {last_observation}")
+
+    print("\nPREDICCIONES")
+    print("--------------------------")
+
+    for i, row in forecast.iterrows():
+        date_spain = row[
+            "datetime_utc"
+        ].tz_convert(SPAIN_TIMEZONE)
+
+        prediction = row["predicted_demand_mw"]
+
+        is_target = i == len(forecast) - 1
+
+        
+        label = (
+            "OBJETIVO"
+            if is_target
+            else "Intermedia"
+        )
+
+        # Identificar el modelo utilizado
+        if method == "hybrid":
+            model_used = row["method"].capitalize()
+        else:
+            model_used = method.capitalize()
+
+        print(
+            f"+{i + 1} h | "
+            f"{date_spain:%d/%m/%Y %H:%M} | "
+            f"{prediction:,.2f} MW | "
+            f"{model_used} | "
+            f"{label}"
+        )
+
+
+    # 5. Resumen final
+    final_prediction = forecast.iloc[-1]
+
+    final_date = final_prediction[
+        "datetime_utc"
+    ].tz_convert(SPAIN_TIMEZONE)
+
+    print("\nPREDICCIÓN OBJETIVO")
+    print("--------------------------")
+    print(f"Fecha (España): {final_date:%d/%m/%Y %H:%M}")
+    print(
+        "Demanda estimada:",
+        f"{final_prediction['predicted_demand_mw']:,.2f} MW"
+    )
 
 
 if __name__ == "__main__":
-    predict_next_hour()
+    parser = argparse.ArgumentParser(
+        description=(
+            "EnergyPredict AI - Predicción "
+            "de demanda eléctrica en España"
+        )
+    )
+
+    parser.add_argument(
+        "--method",
+        choices=["recursive", "direct", "hybrid"],
+        default="recursive",
+        help="Método de predicción (por defecto: recursive)",
+    )
+
+    args = parser.parse_args()
+
+    predict_next_hour(method=args.method)
