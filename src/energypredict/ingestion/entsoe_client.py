@@ -42,10 +42,12 @@ def get_entsoe_demand(start_date, end_date):
     print("Estado HTTP:", response.status_code)
 
     if not response.ok:
-        # No mostrar la URL: contiene el token
-        print("Respuesta:", response.text[:500])
-
-    response.raise_for_status()
+        # Evitar mostrar información sensible de la petición.
+        raise RuntimeError(
+            f"Error al consultar ENTSO-E. "
+            f"Estado HTTP: {response.status_code}. "
+            "Comprueba la conexión o inténtalo de nuevo más tarde."
+        )
 
     return response.text
 
