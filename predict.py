@@ -109,10 +109,11 @@ def get_recent_history():
     return hourly
 
 
-def predict_next_hour(method="recursive"):
+def predict_next_hour(method="recursive", horizon=None, return_data=False):
     # 1. Obtener datos recientes
     hourly = get_recent_history()
 
+    
     # 2. Calcular el horizonte necesario
     last_observation = hourly["datetime_utc"].max()
 
@@ -121,16 +122,26 @@ def predict_next_hour(method="recursive"):
         + pd.Timedelta(hours=1)
     )
 
-    steps = int(
+    minimum_steps = int(
         (target_hour - last_observation)
         / pd.Timedelta(hours=1)
     )
 
-    if steps < 1:
+    if minimum_steps < 1:
         raise ValueError(
             "La última observación no es anterior "
             "a la hora objetivo."
         )
+
+    # El horizonte de la interfaz se cuenta desde la
+    # próxima hora objetivo, no desde el último dato.
+    if horizon is not None:
+        if not isinstance(horizon, int) or not 1 <= horizon <= 6:
+            raise ValueError("El horizonte debe estar entre 1 y 6.")
+
+        steps = minimum_steps + horizon - 1
+    else:
+        steps = minimum_steps
 
     max_steps = 12 if method == "recursive" else 6
 
@@ -138,12 +149,15 @@ def predict_next_hour(method="recursive"):
         raise ValueError(
             f"Se necesitan {steps} predicciones, "
             f"pero el método {method} admite "
-            f"un máximo de {max_steps} horas."
+            f"un máximo de {max_steps} horas. "
+            "Selecciona un horizonte menor o espera "
+            "a que ENTSO-E publique datos más recientes."
         )
 
     print(f"\nMétodo seleccionado: {method}")
     print(f"Horizonte necesario: {steps} horas")
     print(f"Hora objetivo UTC: {target_hour}")
+
 
     # 3. Generar predicciones
     if method == "recursive":
@@ -197,6 +211,19 @@ def predict_next_hour(method="recursive"):
         raise ValueError(
             f"Método no reconocido: {method}"
         )
+
+    
+    # Devolver datos estructurados para la interfaz web
+    if return_data:
+        return {
+            "history": hourly.copy(),
+            "forecast": forecast.copy(),
+            "method": method,
+            "steps": steps,
+            "last_observation": last_observation,
+            "target_hour": target_hour,
+        }
+
 
     # 4. Mostrar resultados
     print("\nENERGYPREDICT AI")
