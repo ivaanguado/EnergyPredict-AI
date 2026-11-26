@@ -231,3 +231,6 @@ data/raw/*
 data/processed/*
 data/predictions/*
 models/*
+
+# Local SQLite database
+data/database/

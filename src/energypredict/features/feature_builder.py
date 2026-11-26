@@ -54,7 +54,7 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     )
 
     df["hour"] = target_local.dt.hour
-    df["day_of_week"] = target_local.dt.dayofweek
+    df["day_of_week"] = target_local.dt.day_of_week
     df["month"] = target_local.dt.month
     df["is_weekend"] = (df["day_of_week"] >= 5).astype(int)
 

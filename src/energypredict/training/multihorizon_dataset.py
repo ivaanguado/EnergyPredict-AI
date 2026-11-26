@@ -85,10 +85,10 @@ def get_horizon_features(
     X = data[feature_columns].copy()
 
     X["hour"] = target_dates.dt.hour
-    X["day_of_week"] = target_dates.dt.dayofweek
+    X["day_of_week"] = target_dates.dt.day_of_week
     X["month"] = target_dates.dt.month
     X["is_weekend"] = (
-        target_dates.dt.dayofweek >= 5
+        target_dates.dt.day_of_week >= 5
     ).astype(int)
 
     return X[feature_columns]

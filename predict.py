@@ -38,6 +38,13 @@ DIRECT_MODELS_DIR = (
 
 SPAIN_TIMEZONE = ZoneInfo("Europe/Madrid")
 
+MODEL_MAX_STEPS = {
+    "recursive": 12,
+    "direct": 6,
+    "hybrid": 6,
+}
+
+MAX_USER_HORIZON = 6
 
 def load_recursive_model():
     artifact = joblib.load(RECURSIVE_MODEL_PATH)
@@ -108,56 +115,93 @@ def get_recent_history():
 
     return hourly
 
+def get_horizon_limits(hourly, method="recursive"):
+    if method not in MODEL_MAX_STEPS:
+        raise ValueError(f"Método no reconocido: {method}")
 
-def predict_next_hour(method="recursive", horizon=None, return_data=False):
-    # 1. Obtener datos recientes
-    hourly = get_recent_history()
-
-    
-    # 2. Calcular el horizonte necesario
     last_observation = hourly["datetime_utc"].max()
 
-    target_hour = (
-        pd.Timestamp.now(tz="UTC").floor("h")
-        + pd.Timedelta(hours=1)
+    current_hour = pd.Timestamp.now(tz="UTC").floor("h")
+
+    delay_hours = int(
+        (current_hour - last_observation)
+        / pd.Timedelta(hours=1)
     )
 
-    minimum_steps = int(
+    max_steps = MODEL_MAX_STEPS[method]
+
+    max_horizon = max(
+        0,
+        min(
+            MAX_USER_HORIZON,
+            max_steps - delay_hours,
+        ),
+    )
+
+    return {
+        "last_observation": last_observation,
+        "current_hour": current_hour,
+        "delay_hours": delay_hours,
+        "max_steps": max_steps,
+        "max_horizon": max_horizon,
+    }
+
+def predict_next_hour(
+    method="recursive",
+    horizon=None,
+    return_data=False,
+    history=None,
+):
+    # 1. Obtener datos recientes
+    hourly = (
+        get_recent_history()
+        if history is None
+        else history.copy()
+    )
+
+    # 2. Calcular los límites del horizonte
+    limits = get_horizon_limits(hourly, method)
+
+    last_observation = limits["last_observation"]
+    max_steps = limits["max_steps"]
+    max_horizon = limits["max_horizon"]
+
+    if horizon is None:
+        horizon = 1
+
+    if not isinstance(horizon, int) or not 1 <= horizon <= 6:
+        raise ValueError(
+            "El horizonte debe estar entre 1 y 6."
+        )
+
+    if horizon > max_horizon:
+        raise ValueError(
+            f"El método {method} permite actualmente "
+            f"un horizonte máximo de {max_horizon} horas "
+            "debido al retraso de ENTSO-E."
+        )
+
+    target_hour = (
+        limits["current_hour"]
+        + pd.Timedelta(hours=horizon)
+    )
+
+    steps = int(
         (target_hour - last_observation)
         / pd.Timedelta(hours=1)
     )
 
-    if minimum_steps < 1:
+    if not 1 <= steps <= max_steps:
         raise ValueError(
-            "La última observación no es anterior "
-            "a la hora objetivo."
-        )
-
-    # El horizonte de la interfaz se cuenta desde la
-    # próxima hora objetivo, no desde el último dato.
-    if horizon is not None:
-        if not isinstance(horizon, int) or not 1 <= horizon <= 6:
-            raise ValueError("El horizonte debe estar entre 1 y 6.")
-
-        steps = minimum_steps + horizon - 1
-    else:
-        steps = minimum_steps
-
-    max_steps = 12 if method == "recursive" else 6
-
-    if steps > max_steps:
-        raise ValueError(
-            f"Se necesitan {steps} predicciones, "
-            f"pero el método {method} admite "
-            f"un máximo de {max_steps} horas. "
-            "Selecciona un horizonte menor o espera "
-            "a que ENTSO-E publique datos más recientes."
+            "El horizonte supera los límites del modelo."
         )
 
     print(f"\nMétodo seleccionado: {method}")
+    print(f"Retraso de ENTSO-E: {limits['delay_hours']} horas")
+    print(f"Horizonte máximo disponible: {max_horizon} horas")
     print(f"Horizonte necesario: {steps} horas")
     print(f"Hora objetivo UTC: {target_hour}")
-
+    
 
     # 3. Generar predicciones
     if method == "recursive":
